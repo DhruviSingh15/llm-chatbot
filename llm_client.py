@@ -30,6 +30,8 @@ class LLMService:
 
     def _init_provider(self):
         """Detect and initialize the active LLM provider (Gemini or OpenAI)."""
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
         forced_provider = os.getenv("LLM_PROVIDER", "").strip().lower()
         gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         openai_key = os.getenv("OPENAI_API_KEY")
@@ -55,7 +57,7 @@ class LLMService:
             self.gemini_client = genai.Client(api_key=api_key)
             self.provider = "gemini"
             # Default to gemini-2.0-flash or gemini-1.5-flash
-            self.model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+            self.model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
             logger.info(f"Gemini client initialized with model: {self.model}")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini client: {e}")
@@ -224,70 +226,79 @@ class LLMService:
         system_prompt: str,
         temperature: float
     ) -> Tuple[str, int]:
+        import time
         from google.genai import types
         from google.genai.errors import APIError
 
-        # Build contents structure for google.genai SDK
-        # google-genai supports system_instruction in GenerateContentConfig
-        try:
-            contents = []
-            for m in messages:
-                role = "user" if m.get("role") == "user" else "model"
-                contents.append(
-                    types.Content(
-                        role=role,
-                        parts=[types.Part.from_text(text=m.get("content", ""))]
+        contents = []
+        for m in messages:
+            role = "user" if m.get("role") == "user" else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=m.get("content", ""))]
+                )
+            )
+
+        config = types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=temperature
+        )
+
+        # Try active model, with fallback models and retry on temporary 503/demand spikes
+        candidate_models = list(dict.fromkeys([self.model, "gemini-3.5-flash-lite", "gemini-3.5-flash"]))
+        last_error = None
+
+        for attempt, mod in enumerate(candidate_models):
+            try:
+                response = self.gemini_client.models.generate_content(
+                    model=mod,
+                    contents=contents,
+                    config=config
+                )
+
+                reply = response.text or ""
+                tokens = 0
+                if hasattr(response, "usage_metadata") and response.usage_metadata:
+                    tokens = getattr(response.usage_metadata, "total_token_count", 0)
+                if not tokens:
+                    tokens = (len(system_prompt) + sum(len(m.get("content", "")) for m in messages) + len(reply)) // 4
+
+                return reply, tokens
+
+            except (APIError, Exception) as e:
+                last_error = e
+                msg = str(e)
+                if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
+                    raise LLMClientError(
+                        "Gemini API rate limit reached. Please wait a moment before trying again.",
+                        status_code=429,
+                        raw_error=e
                     )
-                )
+                elif "INVALID_ARGUMENT" in msg or "API_KEY_INVALID" in msg:
+                    raise LLMClientError(
+                        "Invalid Gemini API key. Please check your GEMINI_API_KEY in .env.",
+                        status_code=401,
+                        raw_error=e
+                    )
+                elif "503" in msg or "high demand" in msg.lower() or "disconnected" in msg.lower() or "connection" in msg.lower():
+                    logger.warning(f"Gemini {mod} transient network/server glitch ({msg}). Retrying in 1.5s... (attempt {attempt+1})")
+                    time.sleep(1.5)
+                    continue
+                else:
+                    logger.exception(f"Gemini API failure: {msg}")
+                    raise LLMClientError(
+                        f"Gemini API error: {e.message if hasattr(e, 'message') else str(e)}",
+                        status_code=502,
+                        raw_error=e
+                    )
 
-            config = types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=temperature
-            )
-
-            response = self.gemini_client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=config
-            )
-
-            reply = response.text or ""
-            tokens = 0
-            if hasattr(response, "usage_metadata") and response.usage_metadata:
-                tokens = getattr(response.usage_metadata, "total_token_count", 0)
-            if not tokens:
-                tokens = (len(system_prompt) + sum(len(m.get("content", "")) for m in messages) + len(reply)) // 4
-
-            return reply, tokens
-
-        except APIError as e:
-            logger.error(f"Gemini API Error: {e}")
-            msg = str(e)
-            if "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                raise LLMClientError(
-                    "Gemini API rate limit reached. Please wait a moment before trying again.",
-                    status_code=429,
-                    raw_error=e
-                )
-            elif "INVALID_ARGUMENT" in msg or "API_KEY_INVALID" in msg:
-                raise LLMClientError(
-                    "Invalid Gemini API key. Please check your GEMINI_API_KEY in .env.",
-                    status_code=401,
-                    raw_error=e
-                )
-            else:
-                raise LLMClientError(
-                    f"Gemini API error: {e.message if hasattr(e, 'message') else str(e)}",
-                    status_code=502,
-                    raw_error=e
-                )
-        except Exception as e:
-            logger.exception("Unexpected Gemini failure")
-            raise LLMClientError(
-                f"An error occurred while contacting Gemini API: {str(e)}",
-                status_code=500,
-                raw_error=e
-            )
+        # If all candidates exhausted
+        raise LLMClientError(
+            f"Gemini API is currently experiencing high demand. Please try again in a few moments.",
+            status_code=503,
+            raw_error=last_error
+        )
 
 
 # Global singleton instance
