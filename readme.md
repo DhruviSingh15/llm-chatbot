@@ -54,8 +54,8 @@ contextai-llm-chatbot/
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/contextai-llm-chatbot.git
-cd contextai-llm-chatbot
+git clone https://github.com/DhruviSingh15/llm-chatbot.git
+cd llm-chatbot
 
 # Optional: Create a virtual environment
 python -m venv venv
